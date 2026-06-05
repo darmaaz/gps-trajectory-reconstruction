@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local cache directory: large OSM parquet + generated viz outputs
+cache/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local agent state
+.claude/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Work-in-progress story/draft notebooks (generated, not ready to ship)
+wip/
+
+# Local environment overrides (data paths etc. — see scripts/_data_paths.py)
+.env
