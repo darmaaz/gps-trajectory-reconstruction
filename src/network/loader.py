@@ -137,6 +137,14 @@ class RoadNetwork:
     # `len(path.edges) - 1` for slot [17].
     node_total_degree: dict[int, int] = field(default_factory=dict)
     _nx_graph_cache: object | None = field(default=None, repr=False, compare=False)
+    # Lazy identity caches — see `twin_indices` / `undirected_segment_keys`.
+    _twin_idx_cache: object | None = field(default=None, repr=False, compare=False)
+    _seg_keys_cache: object | None = field(default=None, repr=False, compare=False)
+    # `(cost_factor, DiGraph)` cache for the direction-violation routing
+    # graph — set lazily by `network.routing` when
+    # `enable_direction_violation` is on. Invalidated alongside
+    # `_nx_graph_cache` (set_typical_speeds_by_class).
+    _nx_graph_permissive_cache: object | None = field(default=None, repr=False, compare=False)
 
     def __len__(self) -> int:
         return len(self.geoms)
@@ -157,6 +165,7 @@ class RoadNetwork:
         )
         self.typical_speeds_ms = new_speeds
         self._nx_graph_cache = None    # graph weights depend on these
+        self._nx_graph_permissive_cache = None
 
     def subgraph_for_bbox(
         self,
@@ -274,6 +283,96 @@ class RoadNetwork:
             cached = {int(arr[i]): i for i in range(len(arr))}
             self._link_to_idx_cache = cached    # type: ignore[attr-defined]
         return cached[int(link_id)]
+
+    # ── physical-road identity ──────────────────────────────────────────
+    #
+    # The PBF parser emits two-way streets as two *independent* directed
+    # edges; the reverse twin gets a synthetic `edge_id` ≥ 10**12 with no
+    # stored linkage to its forward sibling (and split segments lose the
+    # OSM `way_id` entirely). Any consumer that counts, dedups, or
+    # calibrates on raw `link_id` therefore treats one physical street as
+    # two unrelated roads. The two methods below derive a physical-road
+    # identity from the topology arrays alone — no PBF re-parse, no cache
+    # schema change — and are the single sanctioned answer to "are these
+    # two directed edges the same street?".
+    #
+    # Known limitation: distinct parallel ways that genuinely connect the
+    # same node pair (rare; routing already collapses them in its DiGraph
+    # mirror) share an undirected key. Acceptable for counting/metrics;
+    # if it ever matters, refine the key with `way_id` once the parquet
+    # cache schema carries it.
+
+    def undirected_segment_keys(self) -> np.ndarray:
+        """`(E, 2)` int64 array: `(min(from,to), max(from,to))` per edge.
+
+        Canonical *undirected* segment identity — a two-way street's
+        forward and reverse twins map to the same key. Lazily computed
+        and cached; row `e` corresponds to `EdgeIdx e`.
+        """
+        cached = self._seg_keys_cache
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        lo = np.minimum(self.from_node, self.to_node)
+        hi = np.maximum(self.from_node, self.to_node)
+        keys = np.column_stack([lo, hi]).astype(np.int64)
+        keys.setflags(write=False)
+        self._seg_keys_cache = keys
+        return keys
+
+    def segment_key(self, edge_idx: "EdgeIdx") -> tuple[int, int]:
+        """Undirected segment key for an internal edge index."""
+        row = self.undirected_segment_keys()[int(edge_idx)]
+        return (int(row[0]), int(row[1]))
+
+    def segment_key_for_link(self, link_id: int) -> tuple[int, int]:
+        """Undirected segment key for a stable `link_id`.
+
+        Raises `KeyError` for unknown ids (same contract as
+        `edge_index_for_link`).
+        """
+        return self.segment_key(self.edge_index_for_link(link_id))
+
+    def twin_indices(self) -> np.ndarray:
+        """`(E,)` int64 array: `twin[e]` is the `EdgeIdx` of the
+        opposite-direction twin of edge `e`, or `-1` when none exists
+        (one-way street, or a degenerate self-loop).
+
+        A twin is an edge with swapped `(from_node, to_node)` whose length
+        matches within `max(1 m, 0.1 %)` — loader-emitted reverse twins are
+        exact mirrors, so the tolerance only guards float round-trips
+        through the parquet cache. When several reverse edges qualify
+        (parallel ways), the closest length wins. Lazily computed, cached.
+        """
+        cached = self._twin_idx_cache
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        e_count = len(self)
+        twins = np.full(e_count, -1, dtype=np.int64)
+        fr = self.from_node
+        to = self.to_node
+        lengths = self.lengths_m
+        by_pair: dict[tuple[int, int], list[int]] = {}
+        for e in range(e_count):
+            by_pair.setdefault((int(fr[e]), int(to[e])), []).append(e)
+        for e in range(e_count):
+            u, v = int(fr[e]), int(to[e])
+            if u == v:
+                continue    # self-loop: direction is ill-defined
+            reverse = by_pair.get((v, u))
+            if not reverse:
+                continue
+            le = float(lengths[e])
+            tol = max(1.0, 1e-3 * le)
+            best = -1
+            best_d = float("inf")
+            for c in reverse:
+                d = abs(float(lengths[c]) - le)
+                if d <= tol and d < best_d:
+                    best, best_d = c, d
+            twins[e] = best
+        twins.setflags(write=False)
+        self._twin_idx_cache = twins
+        return twins
 
     def project_point(
         self,

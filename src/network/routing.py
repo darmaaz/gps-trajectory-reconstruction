@@ -43,6 +43,7 @@ import numpy as np
 
 from ..geo import equirectangular_distance_m
 from ..model import Path, State
+from .identity import truncate_with_route_diversity
 
 if TYPE_CHECKING:
     from .loader import EdgeIdx, NodeId, RoadNetwork
@@ -111,6 +112,56 @@ def _get_nx_graph(network: "RoadNetwork") -> nx.DiGraph:
         return cached  # type: ignore[return-value]
     G = _build_nx_graph(network)
     network._nx_graph_cache = G
+    return G
+
+
+def _get_permissive_graph(
+    network: "RoadNetwork", cost_factor: float,
+) -> nx.DiGraph:
+    """Legal routing graph plus penalized reverse arcs for one-way edges.
+
+    For every edge with no opposite-direction twin (`twin_indices() == -1`,
+    i.e. a mapped one-way), adds the arc `(to_node, from_node)` with
+        weight   = legal weight × `cost_factor`   (search/diversification cost)
+        illegal  = True                            (traversal is reversed)
+        edge_idx = the underlying edge
+    Two-way edges get nothing — their reverse direction already exists as a
+    real twin edge. A reverse arc is skipped when a real arc `(v, u)`
+    already occupies the slot in the DiGraph (parallel-way corner case).
+
+    The inflated weight steers enumeration away from violations without
+    forbidding them; physical admission stays on `min_traversal_time`
+    computed from the arrays, and plausibility is priced by the
+    `n_direction_violations` feature (μ slot [18]), not by this factor.
+
+    Cached per `(network, cost_factor)`; invalidated with the legal graph.
+    """
+    cached = network._nx_graph_permissive_cache
+    if cached is not None and cached[0] == cost_factor:  # type: ignore[index]
+        return cached[1]  # type: ignore[index,return-value]
+    G = _get_nx_graph(network).copy()
+    twins = network.twin_indices()
+    fr = network.from_node
+    to = network.to_node
+    for e in range(len(network)):
+        if twins[e] != -1:
+            continue
+        u, v = int(fr[e]), int(to[e])
+        if u == v or not G.has_edge(u, v):
+            continue    # degenerate, or edge was skipped/collapsed in build
+        if G.has_edge(v, u):
+            continue    # real reverse arc exists (parallel ways); keep legal
+        data = G[u][v]
+        if data["edge_idx"] != e:
+            continue    # parallel-edge collapse kept a different edge
+        G.add_edge(
+            v, u,
+            weight=data["weight"] * cost_factor,
+            feasibility_weight=data["feasibility_weight"],
+            edge_idx=e,
+            illegal=True,
+        )
+    network._nx_graph_permissive_cache = (cost_factor, G)
     return G
 
 
@@ -218,10 +269,18 @@ def _path_weight(G: nx.DiGraph, node_path: list["NodeId"]) -> float:
     return sum(G[u][v]["weight"] for u, v in zip(node_path, node_path[1:]))
 
 
-def _node_path_to_edge_idxs(
+def _node_path_to_edges_with_direction(
     G: nx.DiGraph, node_path: list["NodeId"],
-) -> list["EdgeIdx"]:
-    return [G[u][v]["edge_idx"] for u, v in zip(node_path, node_path[1:])]
+) -> tuple[list["EdgeIdx"], list[bool]]:
+    """Edge indices plus per-edge reverse-traversal flags (permissive
+    graphs mark wrong-way arcs with `illegal=True`)."""
+    idxs: list["EdgeIdx"] = []
+    revs: list[bool] = []
+    for u, v in zip(node_path, node_path[1:]):
+        data = G[u][v]
+        idxs.append(data["edge_idx"])
+        revs.append(bool(data.get("illegal", False)))
+    return idxs, revs
 
 
 def _penalty_diversified_paths(
@@ -271,6 +330,11 @@ def _build_path(
     expected_travel_time: float,
     time_budget: float,
     min_traversal_time: float,
+    *,
+    middle_reversed: list[bool] | None = None,
+    src_reversed: bool = False,
+    dst_reversed: bool = False,
+    src_backroll: bool = False,
 ) -> Path:
     """Assemble a `Path` dataclass from a routed edge sequence.
 
@@ -283,27 +347,54 @@ def _build_path(
     prior used for the CRF likelihood and dwell residual).
     `min_traversal_time` uses max_speeds (the physical lower bound on
     transit time, used for admission filtering).
+
+    Direction-violation paths (`Config.enable_direction_violation`):
+    `middle_reversed[i]` marks middle edge i as a wrong-way traversal;
+    `src_reversed` means the source edge is exited backward via its
+    `from_node` (span = `start_offset`); `dst_reversed` means the
+    destination edge is entered backward via its `to_node`
+    (span = `length − end_offset`). `src_backroll` marks the same-edge
+    backward traversal (`dst.offset < src.offset` driven in reverse,
+    span = `src.offset − dst.offset`). All default to the legal case,
+    which produces `reversed_mask=None`.
     """
     src_idx_arr = network.edge_ids
     src_link = src_state.link_id
     dst_link = dst_state.link_id
 
     if not middle_edge_idxs and src_link == dst_link:
-        edges = (src_link,)
-        # Backward case (dst.offset < src.offset) deliberately keeps
-        # start_offset > end_offset so the path's `ends_at(dst_state)` check
-        # passes — that's how this stay path attaches to the (i, j) cell.
-        # Length is clamped to 0 for honest zero-motion physics.
-        length_m = max(0.0, dst_state.offset - src_state.offset)
+        edges: tuple[int, ...] = (src_link,)
+        if src_backroll:
+            # Same-edge wrong-way roll: real backward motion, not jitter.
+            length_m = max(0.0, src_state.offset - dst_state.offset)
+        else:
+            # Backward case (dst.offset < src.offset) deliberately keeps
+            # start_offset > end_offset so the path's `ends_at(dst_state)`
+            # check passes — that's how this stay path attaches to the
+            # (i, j) cell. Length is clamped to 0 for honest zero-motion
+            # physics.
+            length_m = max(0.0, dst_state.offset - src_state.offset)
+        mask = (True,) if src_backroll else None
     else:
         middle_links = tuple(int(src_idx_arr[i]) for i in middle_edge_idxs)
         edges = (src_link, *middle_links, dst_link)
-        # Lengths: full src remainder + every middle edge length + dst prefix.
         src_internal_idx = _edge_index_for_link(network, src_link)
-        src_remainder = network.lengths_m[src_internal_idx] - src_state.offset
+        dst_internal_idx = _edge_index_for_link(network, dst_link)
+        src_span = (
+            src_state.offset if src_reversed
+            else network.lengths_m[src_internal_idx] - src_state.offset
+        )
+        dst_span = (
+            network.lengths_m[dst_internal_idx] - dst_state.offset
+            if dst_reversed else dst_state.offset
+        )
         middle_total = float(sum(network.lengths_m[i] for i in middle_edge_idxs))
-        dst_prefix = dst_state.offset
-        length_m = float(src_remainder + middle_total + dst_prefix)
+        length_m = float(src_span + middle_total + dst_span)
+        mids = middle_reversed or [False] * len(middle_edge_idxs)
+        if src_reversed or dst_reversed or any(mids):
+            mask = (src_reversed, *mids, dst_reversed)
+        else:
+            mask = None
 
     return Path(
         edges=edges,
@@ -316,6 +407,7 @@ def _build_path(
         start_perp_m=float(getattr(src_state, "perp_m", 0.0)),
         end_perp_m=float(getattr(dst_state, "perp_m", 0.0)),
         min_traversal_time=min_traversal_time,
+        reversed_mask=mask,
     )
 
 
@@ -334,6 +426,7 @@ def _paths_between(
     *,
     penalty_lambda: float = 0.3,
     actual_budget: float | None = None,
+    allow_violation: bool = False,
 ) -> list[Path]:
     """K time-feasible paths between a single (src, dst) state pair.
 
@@ -346,6 +439,17 @@ def _paths_between(
     `actual_budget` is the unslacked transit budget stored on each `Path`
     for `inferred_dwell` semantics; defaults to `time_budget` when the
     caller doesn't distinguish.
+
+    `allow_violation`: `G` is the permissive graph (wrong-way arcs on
+    one-way edges, marked `illegal`) and the terminal edges may also be
+    traversed against their direction — a one-way source edge can be
+    exited backward via its `from_node`, a one-way destination edge
+    entered backward via its `to_node`, and a same-edge pair with
+    backward offsets on a one-way gets a real reverse-roll path alongside
+    the zero-motion stay. Two-way terminals never get backward variants
+    (their reverse twin is a separate projection candidate already).
+    Resulting paths carry `reversed_mask`; the `n_direction_violations`
+    feature prices them.
     """
     if actual_budget is None:
         actual_budget = time_budget
@@ -363,68 +467,117 @@ def _paths_between(
     src_max = network.max_speeds_ms[src_idx]
     dst_max = network.max_speeds_ms[dst_idx]
 
+    twins = network.twin_indices() if allow_violation else None
+
     # Same-edge: vehicle stayed on this edge. Forward offsets are a partial
     # traversal; backward offsets are zero-motion (GPS along-track jitter at
     # near-stop). `_build_path` clamps `length_m` to `max(0, dst-src)`, so
     # the path correctly represents zero motion in the backward case.
+    # Under `allow_violation`, backward offsets on a ONE-WAY edge also get
+    # a genuine reverse-roll path (parking-lot pull-out / mid-edge U-turn
+    # signature) alongside the stay — the posterior decides which story
+    # the evidence supports.
     if src_idx == dst_idx:
+        out_same: list[Path] = []
         delta_m = max(0.0, dst_state.offset - src_state.offset)
         ttime_typ = 0.0 if delta_m == 0.0 else delta_m / src_typ
         ttime_min = 0.0 if delta_m == 0.0 else delta_m / src_max
-        if ttime_min > time_budget:
-            return []
-        return [_build_path(
-            network, src_state, dst_state, [],
-            ttime_typ, actual_budget, ttime_min,
-        )]
+        if ttime_min <= time_budget:
+            out_same.append(_build_path(
+                network, src_state, dst_state, [],
+                ttime_typ, actual_budget, ttime_min,
+            ))
+        back_m = src_state.offset - dst_state.offset
+        if (
+            twins is not None and twins[src_idx] == -1 and back_m > 0.0
+        ):
+            btyp = back_m / src_typ
+            bmin = back_m / src_max
+            if bmin <= time_budget:
+                out_same.append(_build_path(
+                    network, src_state, dst_state, [],
+                    btyp, actual_budget, bmin, src_backroll=True,
+                ))
+        return out_same
 
-    src_partial_typ = (network.lengths_m[src_idx] - src_state.offset) / src_typ
-    dst_partial_typ = dst_state.offset / dst_typ
-    src_partial_min = (network.lengths_m[src_idx] - src_state.offset) / src_max
-    dst_partial_min = dst_state.offset / dst_max
-    fixed_overhead_typ = src_partial_typ + dst_partial_typ
-    fixed_overhead_min = src_partial_min + dst_partial_min
-    if fixed_overhead_min > time_budget:
-        return []
+    src_len = float(network.lengths_m[src_idx])
+    dst_len = float(network.lengths_m[dst_idx])
 
-    src_to = int(network.to_node[src_idx])
-    dst_from = int(network.from_node[dst_idx])
+    # Terminal traversal options: (boundary_node, span_m, reversed).
+    # Legal: exit src via to_node, enter dst via from_node. Under
+    # violation, a ONE-WAY terminal may also be traversed backward —
+    # two-way terminals are skipped (their reverse twin is a separate
+    # projection candidate; a backward variant would only mint a
+    # duplicate spelling).
+    exits: list[tuple[int, float, bool]] = [
+        (int(network.to_node[src_idx]), src_len - src_state.offset, False),
+    ]
+    entries: list[tuple[int, float, bool]] = [
+        (int(network.from_node[dst_idx]), dst_state.offset, False),
+    ]
+    if twins is not None:
+        if twins[src_idx] == -1:
+            exits.append((int(network.from_node[src_idx]), src_state.offset, True))
+        if twins[dst_idx] == -1:
+            entries.append((int(network.to_node[dst_idx]), dst_len - dst_state.offset, True))
 
-    if src_to == dst_from:
-        return [_build_path(
-            network, src_state, dst_state, [],
-            fixed_overhead_typ, actual_budget, fixed_overhead_min,
-        )]
-
-    if src_to not in G or dst_from not in G:
-        return []
-
-    # Enumerate diverse paths under typical-speed graph cost. Cap the
-    # internal search at a generous multiple of the max-speed-based
-    # admission budget so we don't miss paths that look slow under
-    # typical-speed but are feasible under max-speed (residential roads
-    # have max/typical ratio up to ~2.0; 3× covers that plus headroom).
-    enum_cap_typ = (time_budget - fixed_overhead_min) * 3.0
-    middle_budget = max(enum_cap_typ, 0.1)
-    node_paths = _penalty_diversified_paths(
-        G, src_to, dst_from, middle_budget, k_per_pair, penalty_lambda,
-    )
     out: list[Path] = []
-    for node_path in node_paths:
-        middle_time_typ = _path_weight(G, node_path)
-        edge_idxs = _node_path_to_edge_idxs(G, node_path)
-        # Max-speed time over the same middle edges → admission filter.
-        middle_time_min = sum(
-            float(network.lengths_m[i]) / float(network.max_speeds_ms[i])
-            for i in edge_idxs
-        )
-        total_min = fixed_overhead_min + middle_time_min
-        if total_min > time_budget:
-            continue
-        out.append(_build_path(
-            network, src_state, dst_state, edge_idxs,
-            fixed_overhead_typ + middle_time_typ, actual_budget, total_min,
-        ))
+    for exit_node, src_span, src_rev in exits:
+        for entry_node, dst_span, dst_rev in entries:
+            fixed_overhead_typ = src_span / src_typ + dst_span / dst_typ
+            fixed_overhead_min = src_span / src_max + dst_span / dst_max
+            if fixed_overhead_min > time_budget:
+                continue
+
+            if exit_node == entry_node:
+                out.append(_build_path(
+                    network, src_state, dst_state, [],
+                    fixed_overhead_typ, actual_budget, fixed_overhead_min,
+                    src_reversed=src_rev, dst_reversed=dst_rev,
+                ))
+                continue
+
+            if exit_node not in G or entry_node not in G:
+                continue
+
+            # Enumerate diverse paths under typical-speed graph cost. Cap
+            # the internal search at a generous multiple of the max-speed-
+            # based admission budget so we don't miss paths that look slow
+            # under typical-speed but are feasible under max-speed
+            # (residential roads have max/typical ratio up to ~2.0; 3×
+            # covers that plus headroom).
+            enum_cap_typ = (time_budget - fixed_overhead_min) * 3.0
+            middle_budget = max(enum_cap_typ, 0.1)
+            node_paths = _penalty_diversified_paths(
+                G, exit_node, entry_node, middle_budget, k_per_pair,
+                penalty_lambda,
+            )
+            for node_path in node_paths:
+                edge_idxs, middle_rev = _node_path_to_edges_with_direction(
+                    G, node_path,
+                )
+                # Typical/max-speed times from the arrays (direction-
+                # symmetric), NOT graph weights — permissive-graph weights
+                # carry the violation cost factor, which is a search
+                # steering device, not a travel-time estimate.
+                middle_time_typ = sum(
+                    float(network.lengths_m[i]) / float(network.typical_speeds_ms[i])
+                    for i in edge_idxs
+                )
+                middle_time_min = sum(
+                    float(network.lengths_m[i]) / float(network.max_speeds_ms[i])
+                    for i in edge_idxs
+                )
+                total_min = fixed_overhead_min + middle_time_min
+                if total_min > time_budget:
+                    continue
+                out.append(_build_path(
+                    network, src_state, dst_state, edge_idxs,
+                    fixed_overhead_typ + middle_time_typ, actual_budget,
+                    total_min,
+                    middle_reversed=middle_rev,
+                    src_reversed=src_rev, dst_reversed=dst_rev,
+                ))
     return out
 
 
@@ -486,6 +639,9 @@ def candidate_paths(
     offroad_max_straight_m: float = 300.0,
     offroad_min_detour_ratio: float = 3.0,
     offroad_min_overslack: float = 1.0,
+    diversify_truncation: bool = True,
+    enable_direction_violation: bool = False,
+    direction_violation_cost_factor: float = 3.0,
 ) -> list[Path]:
     """Top-K time-feasible paths from any `src_state` to any `dst_state`.
 
@@ -495,6 +651,16 @@ def candidate_paths(
     across pairs are deduplicated by edge tuple (best — i.e. lowest expected
     travel time — wins on ties), sorted by expected travel time ascending,
     and truncated to `max_paths`.
+
+    `diversify_truncation` (default True) spends the `max_paths` cap on
+    distinct *physical* routes: the |src|×|dst| state-pair sweep typically
+    yields the same corridor under many directed spellings (terminal states
+    on opposite-direction twins, neighbouring corridor edges), and plain
+    expected-travel-time truncation fills the cap with those spellings while
+    crowding out genuinely different routes. The diversified cut keeps the
+    best path per `identity.canonical_route` first, then back-fills with the
+    best remaining spellings; output stays sorted by expected travel time.
+    Set False to recover the legacy behaviour.
 
     `budget_slack` accommodates the gap between OSM `maxspeed` tags and real
     driving speeds — at 1.5, paths the edge-time model thinks would take up
@@ -511,6 +677,12 @@ def candidate_paths(
     posterior decides between the detour and the maneuver. See
     `_offroad_path` and the diagnostic in `scripts/_diag_offroad.py`.
 
+    `enable_direction_violation`: route on the permissive graph (penalized
+    wrong-way arcs on one-way edges) and admit reversed terminal
+    traversals — see `_paths_between`. Default off; resulting paths carry
+    `reversed_mask` and are priced by the `n_direction_violations`
+    feature rather than excluded.
+
     Returns `[]` when no source-destination combination produces a feasible
     path within the slacked budget — the orchestrator interprets this as a
     transition-level discontinuity and splits the trip per SPEC.md §Edge
@@ -518,8 +690,14 @@ def candidate_paths(
     """
     if not src_states or not dst_states:
         return []
-    G = _get_nx_graph(network)
-    by_edges: dict[tuple[int, ...], Path] = {}
+    G = (
+        _get_permissive_graph(network, direction_violation_cost_factor)
+        if enable_direction_violation else _get_nx_graph(network)
+    )
+    # Dedup key includes the traversal-direction mask: a same-edge
+    # reverse-roll and the zero-motion stay share an edge tuple but are
+    # different physical stories.
+    by_edges: dict[tuple, Path] = {}
     # Track, per (src, dst) pair, the shortest routed path's length and the
     # travel time OF THAT shortest path, so the off-road trigger can
     # measure both the detour ratio and whether the detour is overslacked.
@@ -531,8 +709,9 @@ def candidate_paths(
                 src, dst, network, effective_budget, k_per_pair, G,
                 penalty_lambda=penalty_lambda,
                 actual_budget=time_budget_seconds,
+                allow_violation=enable_direction_violation,
             ):
-                key = path.edges
+                key = (path.edges, path.reversed_mask)
                 prev = by_edges.get(key)
                 if prev is None or path.expected_travel_time < prev.expected_travel_time:
                     by_edges[key] = path
@@ -550,6 +729,8 @@ def candidate_paths(
         )
 
     ordered = sorted(by_edges.values(), key=lambda p: p.expected_travel_time)
+    if diversify_truncation:
+        return truncate_with_route_diversity(ordered, network, max_paths)
     return ordered[: max_paths]
 
 
@@ -558,7 +739,7 @@ def _add_offroad_candidates(
     dst_states: list[State],
     network: "RoadNetwork",
     actual_budget: float,
-    by_edges: dict[tuple[int, ...], Path],
+    by_edges: dict[tuple, Path],
     best_routed: dict[tuple[int, int], tuple[float, float]],
     max_straight_m: float,
     min_detour_ratio: float,
@@ -594,7 +775,7 @@ def _add_offroad_candidates(
             if routed_ett <= min_overslack * max(actual_budget, 1.0):
                 continue    # detour fits the budget → plausibly real travel
             off = _offroad_path(network, src, dst, straight, actual_budget)
-            key = off.edges
+            key = (off.edges, off.reversed_mask)
             # Off-road key (src, dst) won't collide with a routed path:
             # a routed 2-edge (src, dst) would require adjacency, which
             # contradicts the detour-ratio trigger. Keep the better

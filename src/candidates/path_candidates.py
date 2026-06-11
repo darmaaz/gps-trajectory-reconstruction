@@ -30,6 +30,9 @@ def enumerate_paths_per_transition(
     offroad_max_straight_m: float = 300.0,
     offroad_min_detour_ratio: float = 3.0,
     offroad_min_overslack: float = 1.0,
+    diversify_truncation: bool = True,
+    enable_direction_violation: bool = False,
+    direction_violation_cost_factor: float = 3.0,
 ) -> list[list[Path]]:
     """Return one `list[Path]` per consecutive observation transition.
 
@@ -68,6 +71,9 @@ def enumerate_paths_per_transition(
             offroad_max_straight_m=offroad_max_straight_m,
             offroad_min_detour_ratio=offroad_min_detour_ratio,
             offroad_min_overslack=offroad_min_overslack,
+            diversify_truncation=diversify_truncation,
+            enable_direction_violation=enable_direction_violation,
+            direction_violation_cost_factor=direction_violation_cost_factor,
         )
         if attach_features and paths:
             paths = [

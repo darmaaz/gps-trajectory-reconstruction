@@ -99,30 +99,46 @@ def link_offset_at_fraction(
     n = len(edges)
 
     # Single-edge path: the entire path lives on edges[0] between
-    # start_offset and end_offset, no walking.
+    # start_offset and end_offset, no walking. A reverse-roll
+    # (direction-violation backward traversal) walks offsets downward.
     if n == 1:
+        if path.edge_reversed(0):
+            return edges[0], path.start_offset - target
         return edges[0], path.start_offset + target
 
-    # Multi-edge path. First edge: only the suffix from start_offset is
-    # available to the path.
+    # Multi-edge path. Each edge contributes a directed span
+    # (from_offset → to_offset); reversed traversals
+    # (`path.reversed_mask`) walk their span downward. Legal paths take
+    # the original arithmetic: suffix of the first edge, full middles,
+    # prefix of the last.
     edge_0_idx = network.edge_index_for_link(edges[0])
-    edge_0_remaining = (
-        float(network.lengths_m[edge_0_idx]) - path.start_offset
-    )
-    if target <= edge_0_remaining:
-        return edges[0], path.start_offset + target
+    edge_0_len = float(network.lengths_m[edge_0_idx])
+    if path.edge_reversed(0):
+        # Exited backward via from_node: span runs start_offset → 0.
+        edge_0_remaining = path.start_offset
+        if target <= edge_0_remaining:
+            return edges[0], path.start_offset - target
+    else:
+        edge_0_remaining = edge_0_len - path.start_offset
+        if target <= edge_0_remaining:
+            return edges[0], path.start_offset + target
     target -= edge_0_remaining
 
-    # Middle edges traversed end-to-end.
+    # Middle edges traversed end-to-end (reversed: to_node → from_node).
     for i in range(1, n - 1):
         idx = network.edge_index_for_link(edges[i])
         edge_len = float(network.lengths_m[idx])
         if target <= edge_len:
-            return edges[i], target
+            return edges[i], (edge_len - target) if path.edge_reversed(i) else target
         target -= edge_len
 
-    # Last edge: only the prefix up to end_offset is on the path. Clamp
-    # defensively in case rounding pushed `target` slightly past it.
+    # Last edge. Legal: prefix up to end_offset. Reversed: entered via
+    # to_node, span runs length → end_offset. Clamp defensively in case
+    # rounding pushed `target` slightly past the span.
+    if path.edge_reversed(n - 1):
+        last_idx = network.edge_index_for_link(edges[-1])
+        last_len = float(network.lengths_m[last_idx])
+        return edges[-1], max(last_len - target, path.end_offset)
     return edges[-1], min(target, path.end_offset)
 
 

@@ -568,6 +568,9 @@ def reconstruct_trajectory(
             offroad_max_straight_m=config.offroad_max_straight_m,
             offroad_min_detour_ratio=config.offroad_min_detour_ratio,
             offroad_min_overslack=config.offroad_min_overslack,
+            diversify_truncation=config.diversify_truncation,
+            enable_direction_violation=config.enable_direction_violation,
+            direction_violation_cost_factor=config.direction_violation_cost_factor,
         )
     else:
         confirmed_dwells = []

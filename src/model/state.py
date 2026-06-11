@@ -11,6 +11,17 @@ import numpy as np
 EdgeId = int
 
 
+def count_violation_runs(mask) -> int:
+    """Number of wrong-way *maneuvers* in a `reversed_mask`: maximal runs of
+    consecutive reversed edges. Split-invariant — one continuous wrong-way
+    drive that OSM happened to split into N edges at intersections counts
+    once. `None`/empty → 0. This (not the per-edge edge count) is the honest
+    direction-violation measure priced by feature slot [18]."""
+    if not mask:
+        return 0
+    return sum(1 for i, f in enumerate(mask) if f and (i == 0 or not mask[i - 1]))
+
+
 class State(Protocol):
     """Abstract state. Concrete representation is `(link_id, offset)`
     plus the canonical `entry_time` from the projected observation, plus
@@ -76,6 +87,21 @@ class Path:
     end_perp_m: float = 0.0
     min_traversal_time: float = 0.0
     is_off_road: bool = False
+    reversed_mask: tuple[bool, ...] | None = None
+    # ^ Direction-violation traversal mask, parallel to `edges`. `None`
+    # (default, the overwhelmingly common case) means every edge is
+    # traversed in its mapped direction. When
+    # `Config.enable_direction_violation` is set, `routing` may emit paths
+    # that traverse a one-way edge AGAINST its mapping (wrong-way street,
+    # parking-lot pull-out, mid-edge U-turn); `reversed_mask[i] == True`
+    # marks `edges[i]` as such a reverse traversal. `edges` keeps real
+    # (positive) link ids either way, so consumers that only resolve ids
+    # (`edge_index_for_link`, class fractions, canonical_route) need no
+    # change; direction-sensitive consumers (turn bearings, geometry
+    # walking, `path_polyline`) must consult the mask. Terminal entries
+    # flip the offset arithmetic: a reversed first edge is exited via its
+    # `from_node` (span = `start_offset`), a reversed last edge is entered
+    # via its `to_node` (span = `length − end_offset`).
     # ^ True for a straight-line off-network candidate connecting two
     # *disconnected* projected edges (parking / arrival / idle-near-
     # one-way-pair maneuvers that legal routing can't represent). When
@@ -98,6 +124,32 @@ class Path:
     # to their bracketing observations — i.e. how well the path's
     # geometry anchors to the actual GPS pings. Populated by
     # `_build_path` from `src_state.perp_m` / `dst_state.perp_m`.
+
+    @property
+    def n_direction_violations(self) -> int:
+        """Count of *edges* traversed against their mapped direction.
+
+        NOT the priced feature — feature slot [18] uses
+        `n_direction_violation_runs` (maneuver count), which is invariant
+        to how OSM split a way. Keep this for raw-edge debugging only.
+
+        `getattr` rather than direct access: `Path` objects pickled
+        before the field existed (cached labels/records) deserialize
+        without it, and must read as fully legal."""
+        mask = getattr(self, "reversed_mask", None)
+        return int(sum(mask)) if mask else 0
+
+    @property
+    def n_direction_violation_runs(self) -> int:
+        """Number of wrong-way *maneuvers* — maximal runs of consecutive
+        reversed edges (see `count_violation_runs`). The split-invariant
+        measure priced by feature slot [18]."""
+        return count_violation_runs(getattr(self, "reversed_mask", None))
+
+    def edge_reversed(self, i: int) -> bool:
+        """Whether `edges[i]` is traversed against its mapped direction."""
+        mask = getattr(self, "reversed_mask", None)
+        return bool(mask[i]) if mask else False
 
     @property
     def inferred_dwell(self) -> float:

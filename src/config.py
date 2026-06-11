@@ -175,11 +175,43 @@ class Config:
     # (more diverse paths, but the second-best path may become much longer
     # than the optimum).
 
+    diversify_truncation: bool = True
+    # ^ Spend the `max_path_candidates` cap on distinct *physical* routes:
+    # the |src|×|dst| state-pair sweep yields the same corridor under many
+    # directed spellings (terminal states projected onto opposite-direction
+    # twins of the same street, or onto neighbouring corridor edges), and a
+    # plain travel-time-sorted cut fills the cap with those spellings while
+    # crowding out structurally different routes. When set, truncation keeps
+    # the best path per `network.identity.canonical_route` first, then
+    # back-fills with the best remaining spellings (set is never smaller
+    # than the legacy cut). False recovers the legacy behaviour exactly.
+
     # Per-class typical speeds for routing cost. None ⇒ use the
     # `V_TYPICAL_MS` defaults. Override to inject data-driven Porto-derived
     # values (computed once from native 15s trajectories) without editing
     # module-level constants.
     typical_speeds_by_class: dict[str, float] | None = None
+
+    # Direction-violation candidate paths. Default ON (promoted after the
+    # held-out gate: capacity 11.0%→7.0% failing, edge-marginal 0.6-0.8 bin
+    # 22pp→5pp gap, confident violation edges 96% truth-traversed; residual
+    # cost = 1/200 windows over-eager violation. See diag_direction_conflict.py
+    # for the prevalence diagnostic). Routing runs on a permissive graph where
+    # every mapped one-way edge also has a penalized reverse arc, and one-way
+    # terminal edges may be exited / entered backward. This admits the
+    # maneuvers the legal directed graph cannot express — wrong-way streets
+    # (taxis do this; OSM oneway tags are also sometimes wrong), parking-lot
+    # pull-outs, mid-edge U-turns — instead of forcing every candidate into
+    # around-the-block loops (the fig-1 failure). Violations are NOT free:
+    # each wrong-way *maneuver* (run of consecutive reversed edges) counts
+    # into feature slot [18] (n_direction_violation_runs), priced by μ — the
+    # shipped dim-19 mu_default learned −2.78/maneuver.
+    enable_direction_violation: bool = True
+    direction_violation_cost_factor: float = 3.0
+    # ^ Multiplicative weight surcharge on reverse arcs during search.
+    # Pure steering: keeps enumeration preferring legal routes so
+    # violations only surface when legal options are poor. Plausibility
+    # pricing belongs to the feature/μ, not this factor.
 
     # Off-road / near-stationary candidate paths. Opt-in (default off):
     # when enabled, a transition whose only routed options are long

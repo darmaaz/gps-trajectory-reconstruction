@@ -27,6 +27,24 @@ that give the CRF a way to penalise implausible paths.
                               `n_signals` / `n_stop_signs` / `n_turns`
                               miss (e.g. a 4-way uncontrolled where the
                               vehicle goes straight through).
+    [18] n_direction_violation_runs — count of wrong-way *maneuvers*:
+                              maximal RUNS of consecutive reversed edges
+                              (`Path.reversed_mask`), NOT per-edge. OSM
+                              splits a street at every intersection, so one
+                              continuous wrong-way drive becomes several
+                              reversed edges; counting runs makes the
+                              feature invariant to that splitting (a single
+                              maneuver costs once, however many edges it
+                              spans). Always 0 unless `Config.
+                              enable_direction_violation` admitted
+                              wrong-way candidates. Expected weight
+                              strongly ≤ 0: a violation is possible
+                              (taxis run one-ways, pull out of lots, OSM
+                              oneway tags are sometimes wrong) but must
+                              cost real evidence to win. Until μ is
+                              retrained at dim 19, `data.default_mu()`
+                              pads a stored 18-dim vector with the hand
+                              prior `DEFAULT_DIRECTION_VIOLATION_WEIGHT`.
 
 All feature values are now in roughly [0, 10] range, keeping `μᵀϕ(p)` in
 a numerically reasonable regime under modest L2 regularisation. Without
@@ -57,9 +75,17 @@ from __future__ import annotations
 import numpy as np
 
 from ..geo import forward_azimuth_deg
-from .state import Path
+from .state import Path, count_violation_runs
 
-FEATURE_DIM: int = 18
+FEATURE_DIM: int = 19
+
+# Hand prior for slot [18] when a pre-bump 18-dim μ file is padded by
+# `data.default_mu()`. −2.0 ≈ e⁻² odds penalty per wrong-way *maneuver*
+# (slot [18] counts runs, not edges): strong enough that a violation only
+# wins when the legal alternatives are implausible (fig-1-style forced
+# loops), weak enough to be winnable. Superseded by retraining μ at dim 19
+# (scripts/compute_15s_labels.py + scripts/retrain_mu.py).
+DEFAULT_DIRECTION_VIOLATION_WEIGHT: float = -2.0
 
 # Indices for the road-class fraction block.
 _CLASS_TO_SLOT: dict[str, int] = {
@@ -98,6 +124,20 @@ def _signed_bearing_delta(b_in: float, b_out: float) -> float:
     """Signed angular change in degrees, ∈ (-180, 180]. Positive = right
     turn (bearings are clockwise from north)."""
     return ((b_out - b_in + 540.0) % 360.0) - 180.0
+
+
+def _entry_bearing(network, edge_idx: int, reversed_: bool) -> float:
+    """Entry bearing honouring traversal direction: a reverse traversal
+    enters where the mapped geometry exits, heading flipped 180°."""
+    if not reversed_:
+        return _edge_entry_bearing(network, edge_idx)
+    return (_edge_exit_bearing(network, edge_idx) + 180.0) % 360.0
+
+
+def _exit_bearing(network, edge_idx: int, reversed_: bool) -> float:
+    if not reversed_:
+        return _edge_exit_bearing(network, edge_idx)
+    return (_edge_entry_bearing(network, edge_idx) + 180.0) % 360.0
 
 
 def path_features(path: Path, network) -> np.ndarray:
@@ -142,13 +182,17 @@ def path_features(path: Path, network) -> np.ndarray:
         return feats
 
     edge_idxs: list[int] = []
-    for link in path.edges:
+    rev_flags: list[bool] = []
+    for i, link in enumerate(path.edges):
         try:
             edge_idxs.append(network.edge_index_for_link(int(link)))
         except KeyError:
             continue
+        rev_flags.append(path.edge_reversed(i))
     if not edge_idxs:
         return feats
+
+    feats[18] = float(count_violation_runs(rev_flags))   # n_direction_violation_runs
 
     # Road-class fractions over edge length. Using `length_meters` (which
     # may include partial source/destination edges) as the denominator
@@ -169,10 +213,12 @@ def path_features(path: Path, network) -> np.ndarray:
     # Turn counts: bearing changes between consecutive edges. Skips the
     # case of a single-edge path (no internal joints).
     n_left = n_right = 0
-    for a, b in zip(edge_idxs, edge_idxs[1:]):
+    for (a, ra), (b, rb) in zip(
+        zip(edge_idxs, rev_flags), zip(edge_idxs[1:], rev_flags[1:]),
+    ):
         delta = _signed_bearing_delta(
-            _edge_exit_bearing(network, a),
-            _edge_entry_bearing(network, b),
+            _exit_bearing(network, a, ra),
+            _entry_bearing(network, b, rb),
         )
         if delta >= _TURN_DEGREES:
             n_right += 1
@@ -188,13 +234,19 @@ def path_features(path: Path, network) -> np.ndarray:
     # regardless of whether it's controlled). Backward-compatible: when
     # the network was built without signal/stop data (e.g., test
     # fixtures), the per-edge arrays are zeros and feats[3]/feats[4] stay 0.
+    # Reversed traversals are excluded from signal/stop counts: the
+    # control sits on the edge's `to_node`, which a reverse traversal
+    # *enters from* rather than exits through — counting it would charge
+    # the path for a control it approaches from the uncontrolled side.
     if hasattr(network, "to_node_is_signal") and len(network.to_node_is_signal) > 0:
         feats[3] = float(sum(
-            int(network.to_node_is_signal[idx]) for idx in edge_idxs[:-1]
+            int(network.to_node_is_signal[idx])
+            for idx, rev in zip(edge_idxs[:-1], rev_flags[:-1]) if not rev
         ))
     if hasattr(network, "to_node_is_stop") and len(network.to_node_is_stop) > 0:
         feats[4] = float(sum(
-            int(network.to_node_is_stop[idx]) for idx in edge_idxs[:-1]
+            int(network.to_node_is_stop[idx])
+            for idx, rev in zip(edge_idxs[:-1], rev_flags[:-1]) if not rev
         ))
 
     # Intersection count: each consecutive edge pair in the path joins at
@@ -206,8 +258,9 @@ def path_features(path: Path, network) -> np.ndarray:
     # raw `len(edges) - 1` proxy.
     if hasattr(network, "node_total_degree") and network.node_total_degree:
         n_intersections = 0
-        for a in edge_idxs[:-1]:
-            connecting_node = int(network.to_node[a])
+        for a, rev in zip(edge_idxs[:-1], rev_flags[:-1]):
+            # A reverse traversal exits via `from_node`, not `to_node`.
+            connecting_node = int(network.from_node[a] if rev else network.to_node[a])
             if network.node_total_degree.get(connecting_node, 0) >= 3:
                 n_intersections += 1
         feats[17] = float(n_intersections)

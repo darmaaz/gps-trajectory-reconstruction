@@ -27,10 +27,14 @@ def _path(
     )
 
 
-def test_feature_dim_is_eighteen():
+def test_feature_dim_is_nineteen():
     """The schema is co-versioned with `mu`. Bumping FEATURE_DIM is a
-    breaking change — this test gates accidental schema drift."""
-    assert FEATURE_DIM == 18
+    breaking change — this test gates accidental schema drift.
+
+    18 → 19 was a conscious bump: slot [18] = n_direction_violations
+    (F5, direction-violation candidates). Stored 18-dim μ files are
+    padded by `data.default_mu()` with the hand prior until retrain."""
+    assert FEATURE_DIM == 19
 
 
 def test_path_features_length_and_travel_slots(grid_network):
