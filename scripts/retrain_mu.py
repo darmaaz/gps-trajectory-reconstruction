@@ -66,6 +66,7 @@ FEATURE_NAMES = [
     "dwell_min", "dwell_ratio",
     "start_perp_10m", "end_perp_10m",
     "n_intersections",
+    "n_direction_violation_runs",
 ]
 
 
@@ -103,6 +104,7 @@ def _print_mu(mu: np.ndarray, scale: float) -> None:
         "14 inferred_dwell/budget": mu[14],
         "15 start_perp_m":          mu[15],
         "16 end_perp_m":            mu[16],
+        "18 n_direction_violation_runs": mu[18],
     }
     print("Sanity sign checks (≤ 0 expected for a real driver-preference fit):")
     for label, val in sign_gates.items():
@@ -184,6 +186,25 @@ def main() -> None:
     network = load_osm_network(PBF, cache_path=OSM_CACHE)
     _log(f"  network: {len(network)} edges")
 
+    # Identifiability check for μ[18] (n_direction_violations): if NO
+    # candidate in the label cache carries a violation (labels built with
+    # --no-direction-violation, or zero conflict windows in the sample),
+    # the slot has zero gradient and L2 regularisation drags it to 0 —
+    # which would make wrong-way traversal FREE at inference. In that
+    # case the fit's value is discarded and the hand prior is pinned.
+    n_viol_cands = sum(
+        1 for t in trips for paths in t.path_candidates for p in paths
+        if p.feature_vector.shape[0] > 18 and p.feature_vector[18] > 0
+    )
+    n_viol_labels = sum(
+        1 for t in trips
+        for k, paths in enumerate(t.path_candidates)
+        if paths[t.label_path_idx[k]].feature_vector.shape[0] > 18
+        and paths[t.label_path_idx[k]].feature_vector[18] > 0
+    )
+    _log(f"  violation candidates in cache: {n_viol_cands} "
+         f"({n_viol_labels} chosen as labels)")
+
     _log("running supervised fit…")
     mu_star, scale_star = fit_supervised(
         trips, network,
@@ -193,6 +214,14 @@ def main() -> None:
                             # the deterministic-label degeneracy that
                             # pegged scale at its lower bound previously.
     )
+
+    if n_viol_cands == 0:
+        from src.model.features import DEFAULT_DIRECTION_VIOLATION_WEIGHT
+        _log("  WARNING: μ[18] unidentifiable (no violation candidates in "
+             "labels) — pinning hand prior "
+             f"{DEFAULT_DIRECTION_VIOLATION_WEIGHT}. Rebuild labels with "
+             "--direction-violation to learn it.")
+        mu_star[18] = DEFAULT_DIRECTION_VIOLATION_WEIGHT
 
     _print_mu(mu_star, scale_star)
 

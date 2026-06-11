@@ -44,7 +44,6 @@ from pathlib import Path
 
 import numpy as np
 import shapely
-from shapely.ops import unary_union
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -127,24 +126,59 @@ def _build_time_to_state_lookup(
 
 
 def _closest_state(
-    cands: list[State], truth_link: int, truth_offset: float,
+    cands: list[State], truth_link: int, truth_offset: float, net,
 ) -> int | None:
     """Pick the candidate at this obs whose link matches the 15s truth
-    and whose offset is closest. None if no candidate's link matches."""
+    and whose offset is closest. Falls back to the truth link's
+    opposite-direction TWIN (same physical street; offset measured from
+    the other end) — without the fallback, a 15s truth state on one twin
+    and a 120s projection on the other silently dropped the whole
+    segment. None if neither matches."""
     matches = [
         (i, c) for i, c in enumerate(cands) if int(c.link_id) == truth_link
+    ]
+    if matches:
+        return min(
+            matches, key=lambda ic: abs(float(ic[1].offset) - truth_offset),
+        )[0]
+    try:
+        t_idx = net.edge_index_for_link(truth_link)
+    except KeyError:
+        return None
+    twin = int(net.twin_indices()[t_idx])
+    if twin == -1:
+        return None
+    twin_link = int(net.edge_ids[twin])
+    flipped = float(net.lengths_m[twin]) - truth_offset
+    matches = [
+        (i, c) for i, c in enumerate(cands) if int(c.link_id) == twin_link
     ]
     if not matches:
         return None
     return min(
-        matches, key=lambda ic: abs(float(ic[1].offset) - truth_offset),
+        matches, key=lambda ic: abs(float(ic[1].offset) - flipped),
     )[0]
 
 
-def _truth_edges_in_window(
-    segments, t_lo, t_hi,
-) -> set[int]:
-    """Set of edge ids traversed by the 15s MLE inside `(t_lo, t_hi]`."""
+def _segment_keys(net, edge_ids) -> set[tuple[int, int]]:
+    """Undirected physical-road keys for a link-id iterable (twin-spelling
+    safe — see src/network/identity.py). Unknown links skipped."""
+    out: set[tuple[int, int]] = set()
+    for e in edge_ids:
+        try:
+            out.add(net.segment_key_for_link(int(e)))
+        except KeyError:
+            continue
+    return out
+
+
+def _truth_segments_in_window(
+    segments, t_lo, t_hi, net,
+) -> set[tuple[int, int]]:
+    """Undirected segment keys traversed by the 15s MLE inside
+    `(t_lo, t_hi]`. Keyed on physical-road identity, NOT raw link ids:
+    the 15s truth and a 120s candidate frequently spell the same street
+    via opposite twins, which a directed-id Jaccard scores as disjoint."""
     edges: set[int] = set()
     for seg in segments:
         ts = seg.canonical_timestamps
@@ -157,28 +191,28 @@ def _truth_edges_in_window(
             step = seg.most_likely[2 * j + 1]
             if isinstance(step, ModelPath):
                 edges.update(int(e) for e in step.edges)
-    return edges
+    return _segment_keys(net, edges)
 
 
 def _best_path_by_overlap(
-    paths: list[ModelPath], truth_edges: set[int],
+    paths: list[ModelPath], truth_segs: set[tuple[int, int]], net,
 ) -> int | None:
     """Index of the candidate path with highest Jaccard overlap against
-    `truth_edges`. Returns None on empty input."""
+    the truth's undirected segment keys. Returns None on empty input."""
     if not paths:
         return None
-    if not truth_edges:
+    if not truth_segs:
         # No 15s edge info — fall back to shortest among candidates that
         # have any edges.
         return int(np.argmin([p.length_meters for p in paths]))
     best_score = -1.0
     best_i: int | None = None
     for i, p in enumerate(paths):
-        cand_edges = set(int(e) for e in p.edges)
-        if not cand_edges:
+        cand_segs = _segment_keys(net, p.edges)
+        if not cand_segs:
             continue
-        inter = len(cand_edges & truth_edges)
-        union = len(cand_edges | truth_edges)
+        inter = len(cand_segs & truth_segs)
+        union = len(cand_segs | truth_segs)
         score = inter / union if union > 0 else 0.0
         # Tie-break by shortest length to prefer simpler paths.
         if score > best_score + 1e-9 or (
@@ -214,11 +248,15 @@ def _best_path_by_pings(
         return min(valid, key=lambda ip: ip[1].length_meters)[0]
     pts = shapely.points(np.column_stack([plons, plats]))
     plats_a, plons_a = np.asarray(plats), np.asarray(plons)
+    from src.network import path_polyline
     best_i, best_key = None, None
     for i, p in valid:
-        geom = unary_union([
-            network.geoms[network.edge_index_for_link(int(e))] for e in p.edges
-        ])
+        # Offset-trimmed driven geometry — full edge unions credited
+        # coverage to road the path never drove (terminal overshoot).
+        pl = path_polyline(p, network)
+        if pl.shape[0] < 2 or not np.isfinite(pl).all():
+            continue
+        geom = shapely.LineString(pl)
         near = shapely.get_point(shapely.shortest_line(pts, geom), 1)
         d = equirectangular_distance_m(
             plats_a, plons_a, shapely.get_y(near), shapely.get_x(near))
@@ -302,11 +340,19 @@ def _build_labeled_segments(
         - confirmed_dwells[k]
         for k in range(len(collapsed) - 1)
     ]
+    # The 120s candidate sets must be enumerated under the SAME
+    # direction-violation regime the model will run with: if no candidate
+    # ever carries a nonzero n_direction_violations feature, μ[18] is
+    # unidentifiable in the supervised fit (zero gradient; L2 drags it to
+    # 0 — which would make wrong-way traversal FREE at inference).
     path_cands = enumerate_paths_per_transition(
         state_cands, net, time_budgets,
         max_path_candidates=base_config.max_path_candidates,
         budget_slack=base_config.path_budget_slack,
         penalty_lambda=base_config.path_penalty_lambda,
+        diversify_truncation=base_config.diversify_truncation,
+        enable_direction_violation=base_config.enable_direction_violation,
+        direction_violation_cost_factor=base_config.direction_violation_cost_factor,
     )
 
     # 4) Identify maximal runs of consecutive viable transitions. A
@@ -354,7 +400,7 @@ def _build_labeled_segments(
                 if truth is None:
                     seg_ok = False
                     break
-                idx = _closest_state(sub_state_cands[k], truth[0], truth[1])
+                idx = _closest_state(sub_state_cands[k], truth[0], truth[1], net)
             if idx is None:
                 seg_ok = False
                 break
@@ -374,9 +420,9 @@ def _build_labeled_segments(
                     sub_path_cands[k], net,
                     [o.lon for o in win], [o.lat for o in win])
             else:
-                truth_edges = _truth_edges_in_window(
-                    segments_15s, t_lo_seg, t_hi_seg)
-                idx = _best_path_by_overlap(sub_path_cands[k], truth_edges)
+                truth_segs = _truth_segments_in_window(
+                    segments_15s, t_lo_seg, t_hi_seg, net)
+                idx = _best_path_by_overlap(sub_path_cands[k], truth_segs, net)
             if idx is None:
                 seg_ok = False
                 break
@@ -436,6 +482,12 @@ def main() -> None:
                          "'raw-pings' = thread the raw GPS pings, no 15s pass; "
                          "'hybrid' = 15s-disambiguated STATE labels + raw-ping "
                          "PATH labels (diagnostic — isolates the state labeling)")
+    ap.add_argument("--direction-violation",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="direction-violation candidates in BOTH the 15s "
+                         "truth reconstruction and the 120s candidate sets "
+                         "(default on — required to identify μ[18]; "
+                         "--no-direction-violation = pre-F5 recipe)")
     args = ap.parse_args()
     n_target, skip, out_path = args.n, args.skip, args.out
 
@@ -457,10 +509,17 @@ def main() -> None:
         mu0 = np.zeros(FEATURE_DIM)
     emit = StudentTEmission(scale=15.0, network=network, df=4.0)
     trans = ExponentialFamilyTransition(mu0)
+    # `enable_direction_violation` matters on BOTH sides: the 15s truth
+    # reconstruction must be able to thread wrong-way corridors (else the
+    # "truth" in direction-conflict windows is itself a forced loop and
+    # the labels reward the wrong candidate), and the 120s candidates
+    # must include violation paths so μ[18] has gradient.
     base_config = Config(emission=emit, transition=trans,
-                         enable_offroad_candidates=args.offroad)
+                         enable_offroad_candidates=args.offroad,
+                         enable_direction_violation=args.direction_violation)
     _log(f"  prior={args.prior} w_length={args.w_length} "
          f"offroad={args.offroad} labels_from={args.labels_from} "
+         f"direction_violation={args.direction_violation} "
          f"n={n_target} skip={skip}")
 
     labelled: list[tuple[str, LabeledTrip]] = []
@@ -522,6 +581,8 @@ def main() -> None:
         "w_length": args.w_length,
         "offroad": args.offroad,
         "labels_from": args.labels_from,
+        "direction_violation": args.direction_violation,
+        "path_match": "undirected-segment-jaccard",   # twin-spelling safe
         "skip": skip,
     }
     CACHE.mkdir(exist_ok=True)

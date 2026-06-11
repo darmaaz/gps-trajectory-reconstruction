@@ -75,7 +75,9 @@ A parsed-edge parquet cache (`cache/pt_edges.parquet`) short-circuits the PBF pa
 
 ### Training the driver model
 
-The shipped default `μ` (`src/data/mu_default.npy`) is fit by supervised MLE on Porto trips where the native 15 s reconstruction acts as ground truth for the 120 s downsampling. The 15 s reconstruction uses a generic, model-independent length prior (which suppresses near-stationary "spur" artifacts the old `μ=0` recipe admitted) and off-road candidates — which is also why `Config.enable_offroad_candidates` now defaults to `True`. The no-argument commands below reproduce the shipped artifacts:
+The shipped default `μ` (`src/data/mu_default.npy`) is fit by supervised MLE on Porto trips where the native 15 s reconstruction acts as ground truth for the 120 s downsampling. The 15 s reconstruction uses a generic, model-independent length prior (which suppresses near-stationary "spur" artifacts the old `μ=0` recipe admitted) and off-road candidates — which is also why `Config.enable_offroad_candidates` now defaults to `True`.
+
+**Schema note (dim 19):** `FEATURE_DIM` is now 19 — slot [18] counts direction-violation *maneuvers* (runs of consecutive reversed edges in `Path.reversed_mask`, so OSM's mid-corridor splits don't over-count a single wrong-way drive; F5). A pre-bump 18-dim `mu_default.npy` is transparently padded with a hand prior (−2.0/maneuver) by `default_mu()`, so inference works unchanged; the dim-19 retrain below replaces the prior with a learned weight (shipped: −2.78/maneuver). The label recipe correspondingly enumerates direction-violation candidates on *both* the 15 s and 120 s sides (without this, μ[18] has zero gradient — `retrain_mu.py` detects that and re-pins the hand prior) and matches paths by undirected segment-key Jaccard, so opposite-twin spellings of the same street no longer score as disjoint. The no-argument commands below reproduce the shipped artifacts:
 
 ```bash
 # Slow side (~50 min): reconstruct each trip at native 15 s, downsample,
@@ -86,7 +88,7 @@ python scripts/compute_15s_labels.py    # writes cache/labeled_trips_15s.pkl.gz
 python scripts/retrain_mu.py            # writes src/data/mu_default.npy
 ```
 
-`compute_15s_labels.py` also accepts `--labels-from raw-pings` (label the 120 s candidates by threading the raw GPS pings, skipping the 15 s pass entirely — under evaluation) and `--prior zero --no-offroad` (the legacy emission-only recipe). Re-run whenever `FEATURE_DIM` changes — `src/data/default_mu()` enforces the shape and falls back to zeros if the file is absent.
+`compute_15s_labels.py` also accepts `--labels-from raw-pings` (label the 120 s candidates by threading the raw GPS pings, skipping the 15 s pass entirely — under evaluation), `--prior zero --no-offroad` (the legacy emission-only recipe), and `--no-direction-violation` (the pre-F5 recipe). Re-run whenever `FEATURE_DIM` changes — `src/data/default_mu()` enforces the shape and falls back to zeros if the file is absent.
 
 ### Tests
 
